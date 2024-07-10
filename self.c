@@ -3,8 +3,9 @@
 #include <windows.h>
 #include "hasher.h"
 int main(){
-    LPVOID imageBase = GetModuleHandleA(NULL);
+    void* imageBase = GetImageBase();
     resolveImports(imageBase);
+    //do not add any code above this line
     Sleep(1000);
-    MessageBoxA(NULL, "ok", "ok", MB_OK);
+    MessageBoxA(NULL, "MESSAGE", "BOX", MB_OK);
 }
