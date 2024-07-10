@@ -4,10 +4,10 @@ Fully automatic Windows API hashing in C
 ![image](https://github.com/fern89/auto-api-hashing/assets/139056562/bf555f8b-7501-4e71-9755-7c915eb99db5)
 
 ## Problem
-Existing Windows API hashing implementations typically require use of C++ (consteval is very useful), and the manual definitions of function declarations. Which is very troublesome.
+Existing Windows API hashing implementations typically require use of C++ (consteval is very useful), and the manual definitions of function declarations. Which is very troublesome. Especially for large existing projects.
 
 ## My solution
-Using this method, we automate everything. On first run, the exe will read its IAT, and replace every name with its hash (and some metadata) (prefixed with a null byte to prevent anything from showing up in PE analysis tools). Then we dump to disk, write to `output.exe`
+Using this method, we automate everything. On first run, the exe will read its IAT, and replace every name with its hash (and some metadata) (prefixed with a null byte to prevent anything from showing up in PE analysis tools). Then we replace the `u1.AddressOfData` of the first thunk with a null, and save the original value elsewhere, this is required so the Windows PE loader does not see the hash and refuse to load the PE because it cannot find the hash in the DLLs. Then we dump to disk, write to `output.exe`
 
 ![image](https://github.com/fern89/auto-api-hashing/assets/139056562/b98511fc-9e94-49fa-a909-a8244026ead4)
 
