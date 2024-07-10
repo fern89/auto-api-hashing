@@ -4,8 +4,9 @@
 #include <windows.h>
 #include <winternl.h>
 #define CRC_SEED 0xdeadbeef
+//refrain from making this an ascii char
 #define FLAG_CHAR 0x69
-const char* reserved[] = {"DeleteCriticalSection", "EnterCriticalSection", "GetLastError", "GetModuleHandleA", "GetStartupInfoA", "InitializeCriticalSection", "IsDBCSLeadByteEx", "LeaveCriticalSection", "MultiByteToWideChar", "SetUnhandledExceptionFilter", "TlsGetValue", "VirtualProtect", "VirtualQuery", "WideCharToMultiByte"};
+//crc32 impl. credits rosettacode
 uint32_t crc32_my(const char *buf){
     size_t len = strnlen(buf, 50);
     static uint32_t table[256];
@@ -37,6 +38,7 @@ uint32_t crc32_my(const char *buf){
     }
     return ~crc;
 }
+
 //lookup address by crc32
 char* hashaddr(HMODULE libraryBase, DWORD hash, void** addr){
     PDWORD functionAddress = (PDWORD)0;
@@ -67,6 +69,30 @@ char* hashaddr(HMODULE libraryBase, DWORD hash, void** addr){
     }
     return NULL;
 }
+//walk peb to find the dll. this because we didnt fix iat yet, cant use GetModuleHandleA
+void* getDllAddr(const wchar_t * DllNameToSearch){
+    PLDR_DATA_TABLE_ENTRY pDataTableEntry = 0;
+    PVOID DLLAddress = 0;
+    PPEB pPEB = (PPEB) __readgsqword(0x60);
+    PPEB_LDR_DATA pLdr = pPEB->Ldr;
+    PLIST_ENTRY AddressFirstPLIST = &pLdr->InMemoryOrderModuleList;
+    PLIST_ENTRY AddressFirstNode = AddressFirstPLIST->Flink;
+    for (PLIST_ENTRY Node = AddressFirstNode; Node != AddressFirstPLIST ;Node = Node->Flink){
+        Node = Node - 1;
+        pDataTableEntry = (PLDR_DATA_TABLE_ENTRY)Node;
+        wchar_t * FullDLLName = (wchar_t *)pDataTableEntry->FullDllName.Buffer;
+        for(int size = wcslen(FullDLLName), cpt = 0; cpt < size ; cpt++){
+            FullDLLName[cpt] = tolower(FullDLLName[cpt]);
+        }
+        if(wcsstr(_wcslwr(FullDLLName), DllNameToSearch) != NULL){
+            DLLAddress = (PVOID)pDataTableEntry->DllBase;
+            return DLLAddress;
+        }
+        Node = Node + 1;
+    }
+
+    return DLLAddress;
+}
 //fix hashed iat
 void* resolveImports(void* imageBase){
     PIMAGE_DOS_HEADER dosHeaders = (PIMAGE_DOS_HEADER)imageBase;
@@ -77,41 +103,50 @@ void* resolveImports(void* imageBase){
     importDescriptor = (PIMAGE_IMPORT_DESCRIPTOR)(importsDirectory.VirtualAddress + (DWORD_PTR)imageBase);
     LPCSTR libraryName = NULL;
     HMODULE library = NULL;
-
     while (importDescriptor->Name != 0){
         libraryName = (LPCSTR)(unsigned long long)importDescriptor->Name + (DWORD_PTR)imageBase;
-        library = GetModuleHandleA(libraryName);
+        size_t cSize = strlen(libraryName)+1;
+        wchar_t* wc = calloc(cSize, sizeof(wchar_t));
+        mbstowcs(wc, libraryName, cSize);
+        library = getDllAddr(_wcslwr(wc));
+        free(wc);
         if (library && strcmp(libraryName, "msvcrt.dll") != 0){
-            
             PIMAGE_THUNK_DATA originalFirstThunk = NULL, firstThunk = NULL;
             originalFirstThunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)imageBase + importDescriptor->OriginalFirstThunk);
             firstThunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)imageBase + importDescriptor->FirstThunk);
-
+            PIMAGE_THUNK_DATA mft = originalFirstThunk;
+            //recover shoved bytes
+            DWORD datum;
+            memcpy(&datum, ((unsigned char*)&((mft+1)->u1.AddressOfData)) + 4, 4);
+            memset(((unsigned char*)&((mft+1)->u1.AddressOfData)) + 4, 0, 4);
+            mft->u1.AddressOfData = datum;
             while (originalFirstThunk->u1.AddressOfData != 0){
                 unsigned char* fname = (unsigned char*)((DWORD_PTR)imageBase + originalFirstThunk->u1.AddressOfData);
+                //hash resolution
                 if(fname[3] == FLAG_CHAR && fname[0] == 0 && fname[1] == 0){
                     void* addr = 0;
                     DWORD hash = 0;
                     memcpy(&hash, fname+4, 4);
                     char* name = hashaddr(library, hash, &addr);
                     if(name!=NULL){
-                        DWORD oldProtect, oldProtect2;
-                        VirtualProtect((LPVOID)(&firstThunk->u1.Function), 8, PAGE_READWRITE, &oldProtect);
                         firstThunk->u1.Function = (unsigned long long)addr;
-                        VirtualProtect((LPVOID)(&firstThunk->u1.Function), 8, oldProtect, &oldProtect2);
-                        VirtualProtect(fname, 50, PAGE_READWRITE, &oldProtect);
                         memcpy(fname, fname+8, 2);
-                        memcpy(fname+2, name, strlen(name));
-                        VirtualProtect(fname, 50, oldProtect, &oldProtect2);
+                        memcpy(fname+2, name, strlen(name)+1);
                     }
                 }
-                ++originalFirstThunk;
-                ++firstThunk;
+                originalFirstThunk++;
+                firstThunk++;
             }
         }
 
         importDescriptor++;
     }
+}
+void* GetImageBase(){
+    PPEB pPEB = (PPEB) __readgsqword(0x60);
+    PPEB_LDR_DATA pLdr = pPEB->Ldr;
+    PLIST_ENTRY AddressFirstPLIST = &pLdr->InMemoryOrderModuleList;
+    return ((PLDR_DATA_TABLE_ENTRY)(AddressFirstPLIST->Flink-1))->DllBase;
 }
 int main();
 //hash iat
@@ -119,6 +154,8 @@ int main2(){
     LPVOID memimg = GetModuleHandleA(NULL);
     PIMAGE_DOS_HEADER dosHeaders = (PIMAGE_DOS_HEADER)memimg;
     PIMAGE_NT_HEADERS ntHeaders0 = (PIMAGE_NT_HEADERS)((DWORD_PTR)memimg + dosHeaders->e_lfanew);
+    
+    //duplicate image in mem
     PVOID imageBase = calloc(ntHeaders0->OptionalHeader.SizeOfImage, 1);    
     memcpy(imageBase, memimg, ntHeaders0->OptionalHeader.SizeOfImage);
     
@@ -136,34 +173,33 @@ int main2(){
     for(int i=0;i<1000;i++) if(memcmp((&main2)+i, nops, 5) == 0) endmain2 = i;
     //remove this function in the output file
     if(endmain2 != 0)
-        memset((void*)((unsigned long long)&main2 - (unsigned long long)memimg + (unsigned long long)imageBase), 0, endmain2);
+        memset((void*)((unsigned long long)&main2 - (unsigned long long)memimg + (unsigned long long)imageBase), 0x90, endmain2);
     while (importDescriptor->Name != 0){
         libraryName = (LPCSTR)(unsigned long long)importDescriptor->Name + (DWORD_PTR)imageBase;
         library = GetModuleHandleA(libraryName);
         if (library && strcmp(libraryName, "msvcrt.dll") != 0){
-            
-            PIMAGE_THUNK_DATA originalFirstThunk = NULL, firstThunk = NULL;
+            PIMAGE_THUNK_DATA originalFirstThunk = NULL;
             originalFirstThunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)imageBase + importDescriptor->OriginalFirstThunk);
-            firstThunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)imageBase + importDescriptor->FirstThunk);
-
+            PIMAGE_THUNK_DATA oft = originalFirstThunk;
+            //do hashing
             while (originalFirstThunk->u1.AddressOfData != 0){
                 functionName = (PIMAGE_IMPORT_BY_NAME)((DWORD_PTR)imageBase + originalFirstThunk->u1.AddressOfData);
-                int accept = 1;
-                for(int i=0;i<(sizeof(reserved)/sizeof(char*)); i++) if(strcmp(reserved[i], functionName->Name) == 0) accept = 0;
-                if(accept){
-                    unsigned int hash = crc32_my(functionName->Name);
-                    unsigned short thunk = *((unsigned short*)functionName);
-                    unsigned char* fname = (unsigned char*)functionName;
-                    memset(fname, 0, strlen(functionName->Name) + 2);
-                    fname[3] = FLAG_CHAR;
-                    memcpy(fname+4, &hash, 4);
-                    memcpy(fname+8, &thunk, 2);
-                }
-                ++originalFirstThunk;
-                ++firstThunk;
+                unsigned int hash = crc32_my(functionName->Name);
+                unsigned short thunk = *((unsigned short*)functionName);
+                unsigned char* fname = (unsigned char*)functionName;
+                memset(fname, 0, strlen(functionName->Name) + 2);
+                fname[3] = FLAG_CHAR;
+                memcpy(fname+4, &hash, 4);
+                memcpy(fname+8, &thunk, 2);
+                originalFirstThunk++;
             }
+            //we pack the first AddressOfData into the second. because we only rly need 4 bytes (no one ever uses the full 8 unless your program is HUGE)
+            //this is needed to make windows happy so that it dont fail to resolve your dlls and cry about it
+            DWORD data = oft->u1.AddressOfData;
+            oft->u1.AddressOfData = 0;
+            oft++;
+            memcpy(((unsigned char*)&(oft->u1.AddressOfData)) + 4, &data, 4);
         }
-
         importDescriptor++;
     }
     //dump to disk
